@@ -4,14 +4,16 @@
  *  1) Serve o dashboard (arquivos da pasta /public, via "assets").
  *  2) A cada minuto (Cron Trigger) confere se os canais ThingSpeak do Monitor 1
  *     e do Monitor 2 continuam recebendo leituras válidas. Se algum ficar mais de
- *     STALE_MINUTES (padrão: 5) sem atualização, envia SMS aos contatos de
- *     ALERT_PHONES. Quando o monitor volta, envia um aviso de recuperação.
+ *     STALE_MINUTES (padrão: 5) sem atualização, avisa pelo Telegram (grupo ou
+ *     pessoas em TELEGRAM_CHAT_IDS) e/ou por SMS (ALERT_PHONES) — qualquer canal
+ *     configurado é usado. Quando o monitor volta, envia um aviso de recuperação.
  *
  * O estado (quem está inoperante e se o SMS já foi enviado) fica em um Durable
  * Object, que tem consistência forte — assim o mesmo alerta não é enviado duas vezes.
  */
 
 const THINGSPEAK_BASE = 'https://api.thingspeak.com';
+const TELEGRAM_BASE = 'https://api.telegram.org';
 const TWILIO_BASE = 'https://api.twilio.com';
 const ZENVIA_BASE = 'https://api.zenvia.com';
 
@@ -45,6 +47,7 @@ export function readConfig(env) {
     reminderMs: nonNegative(env.REMINDER_MINUTES, 0) * 60_000,
     sendRecovery: String(env.SEND_RECOVERY ?? 'true').toLowerCase() !== 'false',
     tz: env.TIMEZONE || 'America/Sao_Paulo',
+    dashboardUrl: /^https?:\/\//i.test(String(env.DASHBOARD_URL ?? '').trim()) ? String(env.DASHBOARD_URL).trim() : '',
   };
 }
 
@@ -82,7 +85,9 @@ async function readLastValid(env, monitor, fetchFn) {
 }
 
 /* ----------------------------------------------------------------------------
- * Textos dos SMS (somente ASCII: cabe em 1 segmento GSM-7 e evita problemas de acento)
+ * Textos dos avisos
+ *  - SMS: somente ASCII (cabe em 1 segmento GSM-7 e evita problemas de acento).
+ *  - Telegram ("rich"): português com acentos, emoji e o link do painel.
  * ------------------------------------------------------------------------- */
 
 function fmtDateTime(ts, tz) {
@@ -108,25 +113,50 @@ function fmtDuration(ms) {
   return m ? `${h}h${String(m).padStart(2, '0')}` : `${h}h`;
 }
 
-export function alertText(items, tz) {
+export function alertText(items, tz, { rich = false, url = '' } = {}) {
+  const isReminder = !items.some((i) => !i.reminder);
+  if (rich) {
+    const lines = items.map(({ monitor, lastAt, age }) =>
+      lastAt === null
+        ? `• ${monitor.name} INOPERANTE: sem leitura válida recente`
+        : `• ${monitor.name} INOPERANTE: sem atualização há ${fmtDuration(age)} (última: ${fmtDateTime(lastAt, tz)})`,
+    );
+    const head = isReminder ? '⏰ LEMBRETE — Estufa Batata' : '🚨 ALERTA — Estufa Batata';
+    return [head, ...lines, ...(url ? ['', `Painel: ${url}`] : [])].join('\n');
+  }
   const lines = items.map(({ monitor, lastAt, age }) =>
     lastAt === null
       ? `${monitor.name} INOPERANTE - sem leitura valida recente`
       : `${monitor.name} INOPERANTE - sem atualizacao ha ${fmtDuration(age)} (ultimo: ${fmtDateTime(lastAt, tz)})`,
   );
-  const prefix = items.some((i) => !i.reminder) ? 'ALERTA' : 'LEMBRETE';
-  return `${prefix} Estufa Batata: ${lines.join('; ')}.`;
+  return `${isReminder ? 'LEMBRETE' : 'ALERTA'} Estufa Batata: ${lines.join('; ')}.`;
 }
 
-export function recoveryText(items) {
+export function recoveryText(items, { rich = false, url = '' } = {}) {
+  if (rich) {
+    const lines = items.map(
+      ({ monitor, downFor }) => `• ${monitor.name} voltou a atualizar (ficou inoperante por ${fmtDuration(downFor)})`,
+    );
+    return ['✅ Estufa Batata — recuperado', ...lines, ...(url ? ['', `Painel: ${url}`] : [])].join('\n');
+  }
   const lines = items.map(
     ({ monitor, downFor }) => `${monitor.name} voltou a atualizar (inoperante por ${fmtDuration(downFor)})`,
   );
   return `OK Estufa Batata: ${lines.join('; ')}.`;
 }
 
+/** Mesma notícia nas duas versões; `notifyAll` escolhe a de cada canal. */
+const alertMessage = (items, cfg) => ({
+  sms: alertText(items, cfg.tz),
+  telegram: alertText(items, cfg.tz, { rich: true, url: cfg.dashboardUrl }),
+});
+const recoveryMessage = (items, cfg) => ({
+  sms: recoveryText(items),
+  telegram: recoveryText(items, { rich: true, url: cfg.dashboardUrl }),
+});
+
 /* ----------------------------------------------------------------------------
- * Envio de SMS (Twilio ou Zenvia)
+ * Envio por SMS (Twilio ou Zenvia) — opcional
  * ------------------------------------------------------------------------- */
 
 /** Aceita +5542999998888, 5542999998888 ou 42999998888 (assume Brasil) e devolve E.164. */
@@ -139,7 +169,7 @@ export function normalizePhone(raw) {
   return `+${digits}`;
 }
 
-const maskPhone = (p) => p.replace(/\d(?=\d{4})/g, '*');
+const maskId = (p) => String(p).replace(/\d(?=\d{4})/g, '*');
 
 export function recipients(env) {
   return [...new Set(String(env.ALERT_PHONES ?? '').split(/[,;\s]+/).map(normalizePhone).filter(Boolean))];
@@ -196,10 +226,10 @@ async function sendOne(env, to, text, fetchFn) {
   }
 }
 
-/** Envia o texto a todos os contatos. Devolve quantos receberam e os erros (sem dados sensíveis). */
-export async function notifyAll(env, text, fetchFn = fetch) {
+/** Resultado de um canal: `null` = canal não configurado (é simplesmente ignorado). */
+async function notifySms(env, text, fetchFn) {
   const phones = recipients(env);
-  if (phones.length === 0) return { sent: 0, failed: ['ALERT_PHONES não configurado'] };
+  if (phones.length === 0) return null;
   const problems = providerProblems(env);
   if (problems.length) return { sent: 0, failed: problems };
 
@@ -208,9 +238,105 @@ export async function notifyAll(env, text, fetchFn = fetch) {
   const failed = [];
   results.forEach((r, i) => {
     if (r.status === 'fulfilled') sent++;
-    else failed.push(`${maskPhone(phones[i])}: ${r.reason?.message ?? r.reason}`);
+    else failed.push(`${maskId(phones[i])}: ${r.reason?.message ?? r.reason}`);
   });
   return { sent, failed };
+}
+
+/* ----------------------------------------------------------------------------
+ * Envio pelo Telegram (Bot API, gratuito)
+ *  - TELEGRAM_BOT_TOKEN: token que o @BotFather entrega ao criar o bot.
+ *  - TELEGRAM_CHAT_IDS: um ou mais destinos separados por vírgula. Um grupo com o bot
+ *    dentro (id negativo, ex.: -1001234567890) avisa todos os integrantes de uma vez;
+ *    uma pessoa tem id positivo (e precisa ter mandado /start ao bot antes).
+ * ------------------------------------------------------------------------- */
+
+/** Separa os destinos válidos (número, com "-" para grupos, ou @canal) dos inválidos. */
+export function telegramChats(env) {
+  const parts = String(env.TELEGRAM_CHAT_IDS ?? '').split(/[,;\s]+/).filter(Boolean);
+  const chats = [];
+  let invalid = 0;
+  for (const part of parts) {
+    if (/^-?\d+$/.test(part) || /^@[A-Za-z]\w{3,}$/.test(part)) {
+      if (!chats.includes(part)) chats.push(part);
+    } else invalid++;
+  }
+  return { chats, invalid };
+}
+
+async function sendTelegram(env, chatId, text, fetchFn) {
+  const token = String(env.TELEGRAM_BOT_TOKEN).trim();
+  const resp = await fetchFn(`${env.TELEGRAM_API_BASE || TELEGRAM_BASE}/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!resp.ok) {
+    const raw = await resp.text().catch(() => '');
+    let detail = raw;
+    try {
+      detail = JSON.parse(raw).description ?? raw;
+    } catch {
+      /* mantém o texto bruto */
+    }
+    throw new Error(`HTTP ${resp.status} ${String(detail).slice(0, 200).replace(/\s+/g, ' ')}`.trim());
+  }
+}
+
+async function notifyTelegram(env, text, fetchFn) {
+  const token = String(env.TELEGRAM_BOT_TOKEN ?? '').trim();
+  const rawChats = String(env.TELEGRAM_CHAT_IDS ?? '').trim();
+  if (!token && !rawChats) return null;
+
+  const missing = [];
+  if (!token) missing.push('TELEGRAM_BOT_TOKEN');
+  if (!rawChats) missing.push('TELEGRAM_CHAT_IDS');
+  if (missing.length) return { sent: 0, failed: [`faltam configurações do Telegram: ${missing.join(', ')}`] };
+
+  const { chats, invalid } = telegramChats(env);
+  const failed = [];
+  if (invalid) failed.push(`TELEGRAM_CHAT_IDS tem ${invalid} valor(es) inválido(s), ignorado(s) (use só números, ex.: -1001234567890)`);
+  if (chats.length === 0) return { sent: 0, failed };
+
+  // O token nunca deve aparecer em log nem na resposta do endpoint de teste.
+  const clean = (msg) => String(msg).split(token).join('***');
+  const results = await Promise.allSettled(chats.map((id) => sendTelegram(env, id, text, fetchFn)));
+  let sent = 0;
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') sent++;
+    else failed.push(`chat ${maskId(chats[i])}: ${clean(r.reason?.message ?? r.reason)}`);
+  });
+  return { sent, failed };
+}
+
+/**
+ * Avisa por todos os canais configurados (Telegram e/ou SMS), em paralelo.
+ * `message` é um texto único ou `{ sms, telegram }`. Devolve `sent` (entregas aceitas, somando
+ * os canais), `failed` (erros sem dados sensíveis) e o detalhe por canal.
+ */
+export async function notifyAll(env, message, fetchFn = fetch) {
+  const msg = typeof message === 'string' ? { sms: message, telegram: message } : message;
+  const names = ['Telegram', 'SMS'];
+  const outcomes = await Promise.all([notifyTelegram(env, msg.telegram, fetchFn), notifySms(env, msg.sms, fetchFn)]);
+
+  const channels = {};
+  names.forEach((name, i) => {
+    if (outcomes[i]) channels[name] = outcomes[i];
+  });
+  const active = Object.entries(channels);
+  if (active.length === 0) {
+    return {
+      sent: 0,
+      failed: ['nenhum canal de aviso configurado (defina TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_IDS, ou ALERT_PHONES + credenciais de SMS)'],
+      channels,
+    };
+  }
+  return {
+    sent: active.reduce((n, [, r]) => n + r.sent, 0),
+    failed: active.flatMap(([name, r]) => r.failed.map((f) => `${name}: ${f}`)),
+    channels,
+  };
 }
 
 /* ----------------------------------------------------------------------------
@@ -218,7 +344,7 @@ export async function notifyAll(env, text, fetchFn = fetch) {
  * ------------------------------------------------------------------------- */
 
 /**
- * Lê os dois canais, compara com o estado salvo e envia os SMS necessários.
+ * Lê os dois canais, compara com o estado salvo e envia os avisos necessários.
  * `store` precisa ter load() e save(obj). Os demais parâmetros existem para os testes.
  */
 export async function runCheck(env, { store, now = Date.now(), fetchFn = fetch } = {}) {
@@ -268,22 +394,22 @@ export async function runCheck(env, { store, now = Date.now(), fetchFn = fetch }
   }
 
   if (alerts.length) {
-    const res = await notifyAll(env, alertText(alerts, cfg.tz), fetchFn);
+    const res = await notifyAll(env, alertMessage(alerts, cfg), fetchFn);
     if (res.sent > 0) {
       for (const a of alerts) {
         a.st.alerted = true;
         a.st.notifiedAt = now;
       }
-      if (res.failed.length) console.warn(`SMS enviado, mas com falhas: ${res.failed.join(' | ')}`);
+      if (res.failed.length) console.warn(`Alerta enviado, mas com falhas: ${res.failed.join(' | ')}`);
     } else {
-      // Nenhum contato recebeu: mantém "alerted=false" para tentar de novo no próximo minuto.
-      console.error(`SMS de alerta NÃO enviado: ${res.failed.join(' | ')}`);
+      // Ninguém recebeu: mantém "alerted=false" para tentar de novo no próximo minuto.
+      console.error(`Alerta NÃO enviado: ${res.failed.join(' | ')}`);
     }
   }
 
   if (recoveries.length && cfg.sendRecovery) {
-    const res = await notifyAll(env, recoveryText(recoveries), fetchFn);
-    if (res.sent === 0) console.error(`SMS de recuperação não enviado: ${res.failed.join(' | ')}`);
+    const res = await notifyAll(env, recoveryMessage(recoveries, cfg), fetchFn);
+    if (res.sent === 0) console.error(`Aviso de recuperação não enviado: ${res.failed.join(' | ')}`);
   }
 
   if (JSON.stringify(next) !== JSON.stringify(state)) await store.save(next);
@@ -320,7 +446,7 @@ function durableStore(env) {
 }
 
 /* ----------------------------------------------------------------------------
- * Endpoint de teste de SMS (opcional, protegido por ADMIN_TOKEN)
+ * Endpoint de teste dos avisos (opcional, protegido por ADMIN_TOKEN)
  * ------------------------------------------------------------------------- */
 
 function safeEqual(a, b) {
@@ -332,14 +458,22 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-async function handleTestSms(request, env, fetchFn) {
+async function handleTestAlert(request, env, fetchFn) {
   if (!env.ADMIN_TOKEN) return new Response('Not found', { status: 404 });
   if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
   if (!safeEqual(request.headers.get('Authorization') ?? '', `Bearer ${env.ADMIN_TOKEN}`)) {
     return new Response('Unauthorized', { status: 401 });
   }
   const cfg = readConfig(env);
-  const res = await notifyAll(env, `TESTE Estufa Batata: SMS de teste enviado em ${fmtDateTime(Date.now(), cfg.tz)}.`, fetchFn);
+  const when = fmtDateTime(Date.now(), cfg.tz);
+  const res = await notifyAll(
+    env,
+    {
+      sms: `TESTE Estufa Batata: aviso de teste enviado em ${when}.`,
+      telegram: `🧪 TESTE — Estufa Batata\nSe você recebeu esta mensagem, os alertas estão funcionando (${when}).`,
+    },
+    fetchFn,
+  );
   return Response.json(res, { status: res.sent > 0 ? 200 : 502 });
 }
 
@@ -350,7 +484,7 @@ async function handleTestSms(request, env, fetchFn) {
 export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
-    if (pathname === '/api/test-sms') return handleTestSms(request, env, fetch);
+    if (pathname === '/api/test-alert' || pathname === '/api/test-sms') return handleTestAlert(request, env, fetch);
     return env.ASSETS.fetch(request);
   },
 

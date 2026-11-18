@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import worker, { runCheck, normalizePhone, StateStore, notifyAll } from '../src/worker.js';
+import worker, { runCheck, normalizePhone, StateStore, notifyAll, telegramChats } from '../src/worker.js';
 
 const MIN = 60_000;
 const NOW = Date.parse('2026-11-18T19:30:00Z'); // 16:30 em São Paulo
@@ -12,9 +12,10 @@ const feed = (ts, { t = '24.5', h = '70' } = {}) => ({
   field2: h,
 });
 
-/** ThingSpeak e provedor de SMS simulados. */
-function makeWorld({ channels = {}, smsFail = () => false } = {}) {
+/** ThingSpeak, Telegram e provedor de SMS simulados. */
+function makeWorld({ channels = {}, smsFail = () => false, tgFail = () => false } = {}) {
   const sms = [];
+  const tg = [];
   const fetchFn = async (url, init = {}) => {
     const u = String(url);
     if (u.includes('thingspeak')) {
@@ -23,6 +24,16 @@ function makeWorld({ channels = {}, smsFail = () => false } = {}) {
       if (data instanceof Error) throw data;
       if (typeof data === 'number') return new Response('{}', { status: data });
       return Response.json({ channel: { id }, feeds: data });
+    }
+    if (u.includes('api.telegram.org')) {
+      const j = JSON.parse(init.body);
+      const token = u.match(/\/bot([^/]+)\/sendMessage$/)[1];
+      const fail = tgFail(j.chat_id, token);
+      if (fail) {
+        return Response.json({ ok: false, error_code: 400, description: fail === true ? 'Bad Request: chat not found' : fail }, { status: 400 });
+      }
+      tg.push({ chat: j.chat_id, text: j.text, token, url: u, init });
+      return Response.json({ ok: true, result: {} });
     }
     let to, body, provider;
     if (u.includes('twilio')) {
@@ -40,7 +51,7 @@ function makeWorld({ channels = {}, smsFail = () => false } = {}) {
     sms.push({ provider, to, body, url: u, init });
     return new Response('{}', { status: 201 });
   };
-  return { sms, fetchFn };
+  return { sms, tg, fetchFn };
 }
 
 function makeStore(initial = {}) {
@@ -68,6 +79,8 @@ const baseEnv = {
   TWILIO_AUTH_TOKEN: 'secret',
   TWILIO_FROM: '+15550001111',
 };
+
+const tgEnv = { CHANNEL_1: '111', CHANNEL_2: '222', TELEGRAM_BOT_TOKEN: '123456:ABC-token', TELEGRAM_CHAT_IDS: '-1001234567890' };
 
 const fresh = (ts = NOW) => [feed(ts - 20_000), feed(ts - 5_000)];
 
@@ -286,6 +299,175 @@ test('Twilio com Messaging Service usa MessagingServiceSid no lugar de From', as
   assert.equal(res.sent, 1);
   assert.equal(form.get('MessagingServiceSid'), 'MG123');
   assert.equal(form.get('From'), null);
+});
+
+test('Telegram: alerta no grupo, texto com acentos e sem repetir a cada minuto', async () => {
+  const { sms, tg, fetchFn } = makeWorld({ channels: { 111: [feed(NOW - 7 * MIN)], 222: fresh() } });
+  const store = makeStore();
+  await runCheck(tgEnv, { store, now: NOW, fetchFn });
+  await runCheck(tgEnv, { store, now: NOW + MIN, fetchFn });
+
+  assert.equal(sms.length, 0, 'sem ALERT_PHONES não há SMS');
+  assert.equal(tg.length, 1, 'uma mensagem para o grupo, sem repetir');
+  assert.equal(tg[0].chat, '-1001234567890');
+  assert.equal(tg[0].text, '🚨 ALERTA — Estufa Batata\n• Monitor 1 INOPERANTE: sem atualização há 7 min (última: 18/11 16:23)');
+  assert.equal(tg[0].url, 'https://api.telegram.org/bot123456:ABC-token/sendMessage');
+  assert.equal(store.data['1'].alerted, true);
+});
+
+test('Telegram: Monitor 2 e os dois juntos, com o link do painel', async () => {
+  const env = { ...tgEnv, DASHBOARD_URL: 'https://monitor-batata.exemplo.workers.dev' };
+  const only2 = makeWorld({ channels: { 111: fresh(), 222: [feed(NOW - 9 * MIN)] } });
+  await runCheck(env, { store: makeStore(), now: NOW, fetchFn: only2.fetchFn });
+  assert.match(only2.tg[0].text, /Monitor 2 INOPERANTE/);
+  assert.doesNotMatch(only2.tg[0].text, /Monitor 1/);
+  assert.match(only2.tg[0].text, /\nPainel: https:\/\/monitor-batata\.exemplo\.workers\.dev$/);
+
+  const both = makeWorld({ channels: { 111: [feed(NOW - 8 * MIN)], 222: [feed(NOW - 10 * MIN)] } });
+  await runCheck(env, { store: makeStore(), now: NOW, fetchFn: both.fetchFn });
+  assert.equal(both.tg.length, 1);
+  assert.match(both.tg[0].text, /Monitor 1 INOPERANTE.*\n• Monitor 2 INOPERANTE/);
+});
+
+test('Telegram: vários destinos (grupo + pessoa), duplicados são ignorados', async () => {
+  const env = { ...tgEnv, TELEGRAM_CHAT_IDS: '-1001234567890, 987654321;987654321' };
+  const { tg, fetchFn } = makeWorld({ channels: { 111: [feed(NOW - 7 * MIN)], 222: fresh() } });
+  await runCheck(env, { store: makeStore(), now: NOW, fetchFn });
+  assert.deepEqual(tg.map((m) => m.chat).sort(), ['-1001234567890', '987654321']);
+});
+
+test('Telegram: aviso de recuperação e SEND_RECOVERY=false', async () => {
+  const store = makeStore();
+  await runCheck(tgEnv, { store, now: NOW, fetchFn: makeWorld({ channels: { 111: [feed(NOW - 7 * MIN)], 222: fresh() } }).fetchFn });
+  const later = NOW + 4 * MIN;
+  const ok = makeWorld({ channels: { 111: fresh(later), 222: fresh(later) } });
+  await runCheck(tgEnv, { store, now: later, fetchFn: ok.fetchFn });
+  assert.equal(ok.tg.length, 1);
+  assert.equal(ok.tg[0].text, '✅ Estufa Batata — recuperado\n• Monitor 1 voltou a atualizar (ficou inoperante por 11 min)');
+  assert.deepEqual(store.data, {});
+
+  const env = { ...tgEnv, SEND_RECOVERY: 'false' };
+  const store2 = makeStore();
+  await runCheck(env, { store: store2, now: NOW, fetchFn: makeWorld({ channels: { 111: [feed(NOW - 7 * MIN)], 222: fresh() } }).fetchFn });
+  const ok2 = makeWorld({ channels: { 111: fresh(later), 222: fresh(later) } });
+  await runCheck(env, { store: store2, now: later, fetchFn: ok2.fetchFn });
+  assert.equal(ok2.tg.length, 0);
+});
+
+test('Telegram: lembrete opcional usa o prefixo LEMBRETE', async () => {
+  const env = { ...tgEnv, REMINDER_MINUTES: '60' };
+  const last = NOW - 7 * MIN;
+  const store = makeStore();
+  await runCheck(env, { store, now: NOW, fetchFn: makeWorld({ channels: { 111: [feed(last)], 222: fresh() } }).fetchFn });
+  const w = makeWorld({ channels: { 111: [feed(last)], 222: fresh(NOW + 61 * MIN) } });
+  await runCheck(env, { store, now: NOW + 61 * MIN, fetchFn: w.fetchFn });
+  assert.equal(w.tg.length, 1);
+  assert.match(w.tg[0].text, /^⏰ LEMBRETE — Estufa Batata\n• Monitor 1 INOPERANTE/);
+});
+
+test('Telegram falhando (chat errado): fica pendente, tenta de novo e depois não duplica', async () => {
+  const channels = { 111: [feed(NOW - 7 * MIN)], 222: fresh() };
+  const store = makeStore();
+  const broken = makeWorld({ channels, tgFail: () => true });
+  await runCheck(tgEnv, { store, now: NOW, fetchFn: broken.fetchFn });
+  assert.equal(broken.tg.length, 0);
+  assert.equal(store.data['1'].alerted, false);
+
+  const working = makeWorld({ channels: { 111: [feed(NOW - 7 * MIN)], 222: fresh(NOW + MIN) } });
+  await runCheck(tgEnv, { store, now: NOW + MIN, fetchFn: working.fetchFn });
+  assert.equal(working.tg.length, 1);
+  assert.equal(store.data['1'].alerted, true);
+
+  const again = makeWorld({ channels: { 111: [feed(NOW - 7 * MIN)], 222: fresh(NOW + 2 * MIN) } });
+  await runCheck(tgEnv, { store, now: NOW + 2 * MIN, fetchFn: again.fetchFn });
+  assert.equal(again.tg.length, 0);
+});
+
+test('Telegram + SMS configurados: avisa pelos dois; se um falha, o outro basta', async () => {
+  const env = { ...baseEnv, ...tgEnv };
+  const ok = makeWorld({ channels: { 111: [feed(NOW - 7 * MIN)], 222: fresh() } });
+  await runCheck(env, { store: makeStore(), now: NOW, fetchFn: ok.fetchFn });
+  assert.equal(ok.tg.length, 1);
+  assert.equal(ok.sms.length, 2);
+  assert.match(ok.sms[0].body, /^[\x20-\x7e]+$/, 'SMS continua ASCII');
+
+  const tgDown = makeWorld({ channels: { 111: [feed(NOW - 7 * MIN)], 222: fresh() }, tgFail: () => true });
+  const store = makeStore();
+  await runCheck(env, { store, now: NOW, fetchFn: tgDown.fetchFn });
+  assert.equal(tgDown.sms.length, 2);
+  assert.equal(store.data['1'].alerted, true, 'o SMS entregou, então não repete');
+});
+
+test('Telegram: configuração incompleta ou inválida não quebra e fica pendente', async () => {
+  const channels = { 111: [feed(NOW - 7 * MIN)], 222: fresh() };
+  const bad = [
+    { ...tgEnv, TELEGRAM_CHAT_IDS: '' },
+    { ...tgEnv, TELEGRAM_BOT_TOKEN: '' },
+    { ...tgEnv, TELEGRAM_CHAT_IDS: 'meu grupo' },
+  ];
+  for (const env of bad) {
+    const { tg, fetchFn } = makeWorld({ channels });
+    const store = makeStore();
+    await runCheck(env, { store, now: NOW, fetchFn });
+    assert.equal(tg.length, 0);
+    assert.equal(store.data['1'].alerted, false);
+  }
+});
+
+test('Telegram: o token nunca vaza nas mensagens de erro', async () => {
+  const fetchFn = async (url) => {
+    throw new Error(`falha de rede em ${url}`);
+  };
+  const res = await notifyAll(tgEnv, 'oi', fetchFn);
+  assert.equal(res.sent, 0);
+  assert.ok(res.failed.length > 0);
+  assert.ok(!JSON.stringify(res).includes('ABC-token'));
+
+  const apiErr = makeWorld({ tgFail: () => 'Unauthorized' });
+  const res2 = await notifyAll(tgEnv, 'oi', apiErr.fetchFn);
+  assert.match(res2.failed[0], /^Telegram: chat -\*+7890: HTTP 400 Unauthorized$/);
+  assert.ok(!JSON.stringify(res2).includes('ABC-token'));
+});
+
+test('nenhum canal configurado: relata o motivo e não envia nada', async () => {
+  const res = await notifyAll({ CHANNEL_1: '111' }, 'oi', async () => assert.fail('não deveria chamar a rede'));
+  assert.equal(res.sent, 0);
+  assert.match(res.failed[0], /nenhum canal de aviso configurado/);
+});
+
+test('telegramChats: aceita ids de grupo/pessoa e @canal; conta os inválidos', () => {
+  assert.deepEqual(telegramChats({ TELEGRAM_CHAT_IDS: ' -100123 , 42;@meucanal\n42 ' }), { chats: ['-100123', '42', '@meucanal'], invalid: 0 });
+  assert.deepEqual(telegramChats({ TELEGRAM_CHAT_IDS: '123abc, ok, 7' }), { chats: ['7'], invalid: 2 });
+  assert.deepEqual(telegramChats({}), { chats: [], invalid: 0 });
+});
+
+test('endpoint /api/test-alert: envia o teste pelo Telegram (e /api/test-sms continua valendo)', async () => {
+  const sent = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), body: JSON.parse(init.body) });
+    return Response.json({ ok: true, result: {} });
+  };
+  try {
+    const env = { ...tgEnv, ADMIN_TOKEN: 's3nha', ASSETS: { fetch: async () => new Response('x') } };
+    for (const path of ['/api/test-alert', '/api/test-sms']) {
+      const r = await worker.fetch(new Request(`https://x.workers.dev${path}`, { method: 'POST', headers: { Authorization: 'Bearer s3nha' } }), env);
+      assert.equal(r.status, 200);
+      const j = await r.json();
+      assert.equal(j.sent, 1);
+      assert.deepEqual(j.failed, []);
+      assert.ok(!JSON.stringify(j).includes('ABC-token'));
+    }
+    assert.equal(sent.length, 2);
+    assert.match(sent[0].body.text, /^🧪 TESTE — Estufa Batata/);
+
+    // sem nenhum canal configurado devolve 502 com o motivo
+    const bare = { CHANNEL_1: '111', ADMIN_TOKEN: 's3nha', ASSETS: env.ASSETS };
+    const r2 = await worker.fetch(new Request('https://x.workers.dev/api/test-alert', { method: 'POST', headers: { Authorization: 'Bearer s3nha' } }), bare);
+    assert.equal(r2.status, 502);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test('normalizePhone', () => {
