@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "monitor-batata",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-01",
+
+  // Dashboard (arquivos da pasta public/) servido pelo próprio Worker
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+
+  // Verificação de inatividade: roda a cada minuto
+  "triggers": { "crons": ["* * * * *"] },
+
+  // Estado dos alertas (Durable Object com SQLite — disponível no plano gratuito)
+  "durable_objects": { "bindings": [{ "name": "STATE", "class_name": "StateStore" }] },
+  "exports": { "StateStore": { "type": "durable-object", "storage": "sqlite" } },
+
+  "observability": { "enabled": true },
+
+  // Configurações NÃO secretas. Telefones e chaves ficam em secrets.json (veja o README).
+  "vars": {
+    "CHANNEL_1": "3577085",
+    "CHANNEL_2": "3577087",
+    "STALE_MINUTES": "5",
+    "REMINDER_MINUTES": "0",
+    "SEND_RECOVERY": "true",
+    "TIMEZONE": "America/Sao_Paulo",
+    "SMS_PROVIDER": "twilio"
+  }
+}

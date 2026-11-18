@@ -1,0 +1,16 @@
+{
+  "name": "monitor-batata",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Dashboard da estufa (ThingSpeak) + alerta por SMS quando um monitor fica inoperante",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "logs": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
